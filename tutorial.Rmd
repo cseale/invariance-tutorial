@@ -265,7 +265,7 @@ do_training <- function(enc, dec, train_x, train_y) {
       rl <- recon_loss(batch_x, x_hat, INPUT_SHAPE)
       pl <- prior_loss(out$z_mean, out$z_log_sigma_sq)
       klcml <- kl_conditional_and_marg_loss(out$z_mean, out$z_log_sigma_sq, DIM_Z)
-      
+
       icvae_loss <- torch_mean(rl + pl + klcml)
       
       # backward pass
@@ -284,6 +284,7 @@ do_training <- function(enc, dec, train_x, train_y) {
                   epoch, as.numeric(icvae_loss$item())))
   }
   if (epoch %% 10 == 0) {
+    print(paste(as.numeric(rl), as.numeric(pl), as.numeric(klcml)))
     torch_save(enc, model_path_enc)
     torch_save(dec, model_path_dec)
   }
@@ -348,5 +349,31 @@ plot_list <- lapply(1:(2*n_plot_samps), function(i) {
 
 # arrange in 2 rows x n_plot_samps columns
 gridExtra::grid.arrange(grobs = plot_list, nrow = 2, ncol = n_plot_samps)
+```
+
+```{r}
+for (i in 0:9) {
+  # forward pass through the ICVAE
+  test_y.t <- torch_zeros(c(ncol(test_y), n_plot_samps))
+  test_y.t[, i + 1] <- 1
+  test_x_hat_c.t <- dec(z, test_y.t)
+  
+  # convert tensors to R matrices
+  test_x_hat_c <- as.array(test_x_hat_c.t)
+  
+  # combine original and reconstructed
+  all_images <- rbind(all_images, test_x_hat_c)
+}
+
+
+# plot grid
+plot_list <- lapply(1:(12*n_plot_samps), function(i) {
+  img <- 1 - vec_to_img(all_images[i, ], IMG_DIM)  # invert for grayscale
+  grid::rasterGrob(img, interpolate = FALSE)
+})
+
+# arrange in 2 rows x n_plot_samps columns
+gridExtra::grid.arrange(grobs = plot_list, nrow = 12, ncol = n_plot_samps)
+
 ```
 
