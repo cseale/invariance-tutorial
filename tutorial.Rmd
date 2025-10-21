@@ -1,0 +1,352 @@
+---
+title: "tutorial"
+output: html_document
+---
+
+```{r}
+library(torch)
+library(torchvision)
+
+train_ds <- mnist_dataset(
+  root = "data",
+  train = TRUE,
+  download = TRUE,
+  transform = function(x) {
+    x <- x$to(dtype = torch_float()) / 255
+    x
+  }
+)
+
+test_ds <- mnist_dataset(
+  root = "data",
+  train = FALSE,
+  download = TRUE,
+  transform = function(x) {
+    x <- x$to(dtype = torch_float()) / 255
+    x
+  }
+)
+
+IMG_DIM <- 28
+NUM_LABELS <- 10
+
+train_x <- train_ds$data
+train_y <- train_ds$targets
+test_x <- test_ds$data
+test_y <- test_ds$targets
+
+train_x <- matrix(as.numeric(train_x), nrow = nrow(train_x), ncol = IMG_DIM^2)/255.0
+test_x <- matrix(as.numeric(test_x), nrow = nrow(test_x), ncol = IMG_DIM^2)/255.0
+
+one_hot_encode <- function(v){
+  diag(length(unique(v)))[v, ]
+  
+}
+
+train_y = one_hot_encode(train_y)
+test_y = one_hot_encode(test_y)
+
+print(dim(train_x))
+print(dim(train_y))
+```
+
+
+# Conditional VAE
+
+```{r}
+DIM_Z <- 16 # output dim of encoder
+DIM_C <- NUM_LABELS # just as an example. Sometimes we also have another y
+INPUT_SHAPE <- IMG_DIM ** 2 # input
+ACTIVATION <- "tanh"
+```
+
+### Encoder
+
+```{r}
+encoder <- nn_module(
+  "Encoder",
+  
+  initialize = function(input_shape, dim_z) {
+    self$enc_h1 <- nn_linear(input_shape, 512)
+    self$enc_h2 <- nn_linear(512, 512)
+    self$z_mean <- nn_linear(512, dim_z)
+    self$z_log_sigma_sq <- nn_linear(512, dim_z)
+  },
+  
+  forward = function(x) {
+    h1 <- torch_tanh(self$enc_h1(x))
+    h2 <- torch_tanh(self$enc_h2(h1))
+    z_mean <- torch_tanh(self$z_mean(h2))
+    z_log_sigma_sq <- self$z_log_sigma_sq(h2)  # linear
+    list(z_mean = z_mean, z_log_sigma_sq = z_log_sigma_sq)
+  }
+)
+
+# example: create encoder instance
+enc <- encoder(input_shape = INPUT_SHAPE, dim_z = DIM_Z)
+```
+
+### Reparameterisation trick
+
+```{r}
+# reparameterization function
+sampling <- function(z_mean, z_log_var) {
+  # standard deviation
+  z_sigma <- torch_exp(0.5 * z_log_var)
+  
+  # sample epsilon from standard normal
+  epsilon <- torch_randn_like(z_sigma)
+  
+  # reparameterize
+  z <- z_mean + z_sigma * epsilon
+  z
+}
+```
+
+
+```{r}
+
+decoder <- nn_module(
+  "Decoder",
+  
+  initialize = function(dim_c, dim_z, input_shape) {
+    self$dec_h1 <- nn_linear(dim_z + dim_c, 512)
+    self$dec_h2 <- nn_linear(512, 512)
+    self$x_hat <- nn_linear(512, input_shape)
+  },
+  
+  forward = function(z, c) {
+    # concatenate latent vector z with additional input c
+    z_with_c <- torch_cat(list(z, c), dim = 2)  # dim=2 because R torch uses (batch, features)
+    
+    # first hidden layer
+    h1 <- torch_tanh(self$dec_h1(z_with_c))
+    
+    # second hidden layer
+    h2 <- torch_tanh(self$dec_h2(h1))
+    
+    # output layer, linear activation
+    x_hat <- self$x_hat(h2)
+    x_hat
+  }
+)
+
+# Example: create decoder instance
+dec <- decoder(dim_c = DIM_C, dim_z = DIM_Z, input_shape = INPUT_SHAPE)
+```
+
+### Loss construction for invariance
+
+```{r}
+params <- list(
+  beta = 0.1,
+  lambda = 1.0
+)
+
+nn_recon_loss <- nn_module(
+  "ReconLoss",
+  
+  initialize = function() {
+    # No parameters in this loss
+  },
+  
+  forward = function(pred, target, input_shape) {
+    # reconstruction loss (MSE)
+    recon_loss <- torch_mean((target - pred)^2, dim = 2)  # mean over features
+    recon_loss <- recon_loss * input_shape  # optional scaling
+    return(recon_loss)
+  }
+)
+
+nn_prior_loss <- nn_module(
+  "PriorLoss",
+  
+  initialize = function() {
+    # No parameters in this loss
+  },
+  
+  forward = function(z_mean, z_log_sigma_sq) {
+    # prior (KL) loss
+    prior_loss <- 1 + z_log_sigma_sq - z_mean^2 - torch_exp(z_log_sigma_sq)
+    prior_loss <- torch_sum(prior_loss, dim = 2)  # sum over latent dims
+    prior_loss <- prior_loss * -0.5
+    return(prior_loss)
+  }
+)
+```
+
+
+
+```{r}
+all_pairs_gaussian_kl <- function(mu, sigma, add_third_term = FALSE) {
+  # sigma squared + epsilon
+  sigma_sq <- sigma^2 + 1e-8
+  sigma_sq_inv <- 1 / sigma_sq
+  
+  # first term: dot product of sigma vectors
+  first_term <- torch_mm(sigma_sq, sigma_sq_inv$t())
+  
+  # r terms
+  r <- torch_mm(mu * mu, sigma_sq_inv$t())
+  r2 <- torch_sum(mu * mu * sigma_sq_inv, dim = 2, keepdim = TRUE)
+  
+  # second term: squared distance with broadcasting
+  second_term <- 2 * torch_mm(mu, (mu * sigma_sq_inv)$t())
+  second_term <- r - second_term + r2$t()
+  
+  # third term: log determinant differences
+  if (add_third_term) {
+    r_log <- torch_sum(torch_log(sigma_sq), dim = 2, keepdim = TRUE)
+    third_term <- r_log - r_log$t()
+  } else {
+    third_term <- torch_zeros_like(first_term)
+  }
+  
+  0.5 * (first_term + second_term + third_term)
+}
+
+nn_kl_conditional_and_marg_loss <- nn_module(
+  "KLConditionalAndMargLoss",
+  
+  initialize = function() {
+    # No parameters in this loss
+  },
+  
+  forward = function(z_mean, z_log_sigma_sq, dim_z) {
+    z_sigma <- torch_exp(0.5 * z_log_sigma_sq)
+    all_pairs_GKL <- all_pairs_gaussian_kl(z_mean, z_sigma, TRUE) - 0.5 * dim_z
+    return(torch_mean(all_pairs_GKL))
+  }
+)
+```
+
+```{r}
+do_training <- function(enc, dec, train_x, train_y) {
+  # optimizer
+  num_epochs <- 100
+  learning_rate <- 0.0005
+  opt <- optim_adam(params = c(enc$parameters, dec$parameters), lr = learning_rate)
+  batch_size <- 32
+  num_batches <- ceiling(nrow(train_x) / batch_size)  # or length(loader)
+  
+  recon_loss <- nn_recon_loss()
+  prior_loss <- nn_prior_loss()
+  kl_conditional_and_marg_loss <- nn_kl_conditional_and_marg_loss()
+  epoch <- 1
+  
+  train_x.t <- torch_tensor(train_x, dtype = torch_float())
+  train_y.t <- torch_tensor(train_y, dtype = torch_float())  # one-hot labels
+  dataset <- tensor_dataset(train_x.t, train_y.t)
+  loader <- dataloader(dataset, batch_size = batch_size, shuffle = TRUE)
+  
+  # # for debugging
+  # # get an iterator
+  # loader_iter <- dataloader_make_iter(loader)
+  # # get first batch
+  # batch <- dataloader_next(loader_iter)
+  
+  # Training loop example
+  for (epoch in 1:num_epochs) {
+    batch_idx <- 0
+    
+    coro::loop(for (batch in loader) {
+      batch_idx <- batch_idx + 1
+      batch_x <- batch[[1]]
+      batch_y <- batch[[2]]
+      
+      opt$zero_grad()
+      
+      # forward pass
+      out <- enc(batch_x) # encode
+      z <- sampling(out$z_mean, out$z_log_sigma_sq) # reparam trick
+      x_hat <- dec(z, batch_y) # decode
+      
+      # compute losses
+      rl <- recon_loss(batch_x, x_hat, INPUT_SHAPE)
+      pl <- prior_loss(out$z_mean, out$z_log_sigma_sq)
+      klcml <- kl_conditional_and_marg_loss(out$z_mean, out$z_log_sigma_sq, DIM_Z)
+      
+      icvae_loss <- torch_mean(rl + pl + klcml)
+      
+      # backward pass
+      icvae_loss$backward()
+      opt$step()
+      
+      if (batch_idx %% 50 == 0) {
+        # print fraction of batches completed
+        cat(sprintf("Epoch %d, Batch %d/%d (%.2f%%), Batch Loss: %.4f\n",
+                    epoch, batch_idx, num_batches, 100 * batch_idx / num_batches,
+                    as.numeric(icvae_loss$item())))
+      }
+    })
+    
+    cat(sprintf("Epoch %d, Loss: %.4f\n",
+                  epoch, as.numeric(icvae_loss$item())))
+  }
+  if (epoch %% 10 == 0) {
+    torch_save(enc, model_path_enc)
+    torch_save(dec, model_path_dec)
+  }
+  return(list(enc = enc, dec = dec))
+}
+
+```
+
+```{r}
+model_path_enc <- "data/encoder.pt"
+model_path_dec <- "data/decoder.pt"
+
+if (file.exists(model_path_enc) && file.exists(model_path_dec)) {
+  cat("Found saved models, loading...\n")
+  enc <- torch_load(model_path_enc)
+  dec <- torch_load(model_path_dec)
+} else {
+  if (!dir.exists("data")) dir.create("data")
+  results <- do_training(enc, dec, train_x, train_y)
+  enc <- results$enc
+  dec <- results$dec
+}
+```
+
+```{r}
+library(grid)
+library(gridExtra)
+
+n_plot_samps <- 10
+
+# convert test data to tensors
+test_x.t <- torch_tensor(test_x[1:n_plot_samps, ], dtype = torch_float())
+test_y.t <- torch_tensor(test_y[1:n_plot_samps, ], dtype = torch_float())
+
+# forward pass through the ICVAE
+out <- enc(test_x.t)
+z <- sampling(out$z_mean, out$z_log_sigma_sq)
+test_x_hat.t <- dec(z, test_y.t)
+
+# convert tensors to R matrices
+test_x_hat <- as.array(test_x_hat.t)
+test_x_orig <- test_x[1:n_plot_samps, ]
+
+# combine original and reconstructed
+all_images <- rbind(test_x_orig, test_x_hat)
+
+clip01 <- function(x) pmin(pmax(x, 0), 1)
+
+# helper to convert a row vector to matrix image
+vec_to_img <- function(vec, dim) {
+  # reshape and clip
+  img <- matrix(clip01(vec), nrow = dim, ncol = dim, byrow = TRUE)
+  img <- t(img)  # flip vertically and horizontally
+  img
+}
+
+# plot grid
+plot_list <- lapply(1:(2*n_plot_samps), function(i) {
+  img <- 1 - vec_to_img(all_images[i, ], IMG_DIM)  # invert for grayscale
+  grid::rasterGrob(img, interpolate = FALSE)
+})
+
+# arrange in 2 rows x n_plot_samps columns
+gridExtra::grid.arrange(grobs = plot_list, nrow = 2, ncol = n_plot_samps)
+```
+
