@@ -282,12 +282,15 @@ do_training <- function(enc, dec, train_x, train_y) {
     
     cat(sprintf("Epoch %d, Loss: %.4f\n",
                   epoch, as.numeric(icvae_loss$item())))
-  }
-  if (epoch %% 10 == 0) {
     print(paste(as.numeric(rl), as.numeric(pl), as.numeric(klcml)))
-    torch_save(enc, model_path_enc)
-    torch_save(dec, model_path_dec)
+    if (epoch %% 10 == 0) {
+      torch_save(enc, model_path_enc)
+      torch_save(dec, model_path_dec)
+    }
   }
+  
+  torch_save(enc, model_path_enc)
+  torch_save(dec, model_path_dec)
   return(list(enc = enc, dec = dec))
 }
 
